@@ -1,0 +1,26 @@
+Processing csv files: /Users/redondo/R/SDR_Bayes-master/backup_objs/san_francisco_ext_202209/flu_poisson_new-202210140853-1-8768f2.csvWarning: non-fatal error reading adaptation data
+, /Users/redondo/R/SDR_Bayes-master/backup_objs/san_francisco_ext_202209/flu_poisson_new-202210140853-2-8768f2.csvWarning: non-fatal error reading adaptation data
+, /Users/redondo/R/SDR_Bayes-master/backup_objs/san_francisco_ext_202209/flu_poisson_new-202210140853-3-8768f2.csvWarning: non-fatal error reading adaptation data
+, /Users/redondo/R/SDR_Bayes-master/backup_objs/san_francisco_ext_202209/flu_poisson_new-202210140853-4-8768f2.csvWarning: non-fatal error reading adaptation data
+
+
+Checking sampler transitions treedepth.
+4 of 8000 (0.05%) transitions hit the maximum treedepth limit of 10, or 2^10 leapfrog steps.
+Trajectories that are prematurely terminated due to this limit will result in slow exploration.
+For optimal performance, increase this limit.
+
+Checking sampler transitions for divergences.
+1107 of 8000 (13.84%) transitions ended with a divergence.
+These divergent transitions indicate that HMC is not fully able to explore the posterior distribution.
+Try increasing adapt delta closer to 1.
+If this doesn't remove all divergences, try to reparameterize the model.
+
+Checking E-BFMI - sampler transitions HMC potential energy.
+E-BFMI satisfactory.
+
+Effective sample size satisfactory.
+
+Split R-hat values satisfactory all parameters.
+
+Processing complete.
+

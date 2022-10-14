@@ -1,0 +1,1090 @@
+---
+title: "San Francisco data - New Model"
+output: 
+  pdf_document:
+    number_sections: true
+header-includes:
+  - \usepackage{booktabs}
+urlcolor: blue
+---
+
+\tableofcontents 
+
+```{r setup, include=FALSE, message=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+\newpage
+
+# Supporting tools
+
+First, we load the libraries and custom functions that support the analysis.
+
+```{r}
+library(bayesplot)
+library(cmdstanr)
+library(dplyr)
+library(extraDistr)
+library(GGally)
+library(ggplot2)
+library(reshape2)
+library(ggpubr)
+library(ggridges)
+library(gridExtra)
+library(kableExtra)
+library(lubridate)
+library(Metrics)
+library(patchwork)
+library(posterior)
+library(purrr)
+library(readr)
+library(readsdr)
+library(readxl)
+library(writexl)
+library(scales)
+library(stringr)
+library(tidyr)
+library(viridisLite)
+
+# Custom functions
+source("./R/helpers.R")
+source("./R/plots.R")
+# source("./R/incidence_comparison.R")
+
+# Custom model functions
+source("./R/mdls/generate_deSolve_components.R")
+source("./R/mdls/utils.R")
+source("./R/mdls/arrange_variables.R")
+source("./R/mdls/extract_variables.R")
+source("./R/mdls/stan_ode_function_2.R")
+source("./R/mdls/plots_2.R")
+
+# Backup folder
+fldr <- "./backup_objs/san_francisco_ext_202210"
+dir.create(fldr, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Data
+
+We read the _xls_ file that contains the incidence data and transform it into
+a format suitable for the analysis.
+
+```{r, echo = TRUE, fig.height = 3.5}
+# Change according to input data
+flu_data <- read_xls("./data/rsif20060161s03.xls", range = "A6:C69") %>% 
+  rename(time = Time, y = Cases) %>% 
+  mutate(time = time + 1,
+         Date = ymd(Date),
+         Week = epiweek(Date))
+flu_data
+```
+
+
+## Daily data
+
+For this graph and the remaining figures, *ggplot2* provides the framework for
+creating visualisations. Here, we show the daily case notifications during the autumn wave of the influenza pandemic (Spanish flu) in the city of San Francisco, California, from 1918 to 1919.
+
+```{r, fig.height = 3.5}
+g <- ggplot(flu_data, aes(x = Date, y = y)) +
+  geom_col(fill = "steelblue") +
+  theme_pubclean() +
+  labs(x = "Time (days)",
+       y = "Incidence (People per day)")
+
+print(g)
+```
+
+
+# Calibration workflow
+
+## Prior information - $\pi(\theta)$
+
+The following list corresponds to the time-independent variables and initial
+conditions of the SEIR model that will be fitted to the San Francisco data. For
+each parameter, we indicate their prior knowledge. We construct prior
+distributions for parameters for which we cannot obtain direct estimates and 
+present them in a density plot.
+
+Fisrt of all, as one of the parameters (the recovery rate for hospitalized class) of the model is calculated as follows:
+
+$\gamma_2 = 1/(1/\gamma_1 - 1/\alpha)$
+
+If $\gamma_1$ is greater than $\alpha$, the parameter would take a negative value, which is impossible.
+
+To solve this, the following can be done:
+
+$\gamma_1 = \omega * \alpha$
+
+Where $\omega$ is a new parameter bounded between 0 and 1. In this way, we always make sure that $\gamma_1$ is never greater that $\alpha$. We would estimate $\omega$ instead of $\gamma_1$ so that we could work with less stringent priors.
+
+* Initial population: $N(0)$ = 550000 [People]
+
+* Initial death: $D(0)$ = 0 [People]
+
+* Initial recovered: $R(0)$ = 0 [People]
+
+* Initial diagnosed and reported: $J(0)$ = 0 [People]
+
+* Initial asymptomatic and partially infectious: $A(0)$ = 0 [People]
+
+* Initial susceptible: $S(0)$) = $N(0)$ - $E(0)$ - $I(0)$ [People]
+
+*
+
+* Birth and natural death rates: $\mu$ = 1 / (60 * 365) [1 / day]
+
+* Rate of progression to infectious: $k$ = 1 / 1.9 [1 / day]
+
+*
+
+* Recovery rate: $\gamma_1 = \omega * \alpha$ [1 / day]
+
+* Recovery rate for hospitalized class: $\gamma_2 = \frac{1}{\frac{1}{\gamma_1} - \frac{1}{\alpha}}$ [1 / day]
+
+* Mortality rate: $\delta = \frac{CFP}{1-CFP}(\mu + \gamma_2)$ [1 / day] (being Case fatality proportion CFP = deaths / cases = $\frac{1908}{28310}=0.067$)
+
+*
+
+*
+
+* Initial infected: $I(0) \sim lognormal(1, 1)$ [People]
+
+* Initial exposed: $E(0) \sim lognormal(1, 1)$ [People]
+
+* Rate of effective contacts per infected individual: $\beta \sim lognormal(0.5, 1)$ [1 / day]
+
+* Relative infectiousness of the asymptomatic class: $q \sim beta(0.75, 30)$
+
+* Proportion of clinical infections: $\rho \sim beta(10, 40)$
+
+* Diagnostic rate $\alpha \sim lognormal(-0.75, 0.1)$ [1 / day]
+
+* Auxiliary parameter: $\omega \sim beta(2, 2)$
+
+```{r, fig.height = 2}
+g1 <- ggplot(NULL, aes(c(0, 10))) + 
+  geom_area(stat = "function", fun = dlnorm, fill = "grey95", 
+            colour = "grey60", args = list(meanlog = 0.5, sdlog = 1)) +
+  scale_x_continuous(breaks = c(0, 5, 10)) +
+  theme_pubr() +
+  labs(y = "",
+       x = bquote(beta)) +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+g1
+```
+
+```{r, fig.height = 2}
+g2   <- ggplot(NULL, aes(c(0, 0.1))) + 
+   geom_area(stat = "function", fun = dbeta, fill = "grey95", 
+            colour = "grey60", args = list(shape1 = 0.75, shape2 = 30)) +  
+  scale_x_continuous(breaks = c(0, 0.05, 0.1)) +
+  theme_pubr() +
+  labs(y = "",
+       x = "q") +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+g3   <- ggplot(NULL, aes(c(0, 1))) + 
+   geom_area(stat = "function", fun = dbeta, fill = "grey95", 
+            colour = "grey60", args = list(shape1 = 10, shape2 = 40)) +  
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  theme_pubr() +
+  labs(y = "",
+       x = bquote(rho)) +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+print(g2 + g3)
+```
+
+```{r, fig.height = 2}
+g4 <- ggplot(NULL, aes(c(0, 1))) + 
+  geom_area(stat = "function", fun = dlnorm, fill = "grey95", 
+            colour = "grey60", args = list(meanlog = -0.7, sdlog = 0.2)) +
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  theme_pubr() +
+  labs(y = "",
+       x = bquote(alpha)) +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+g4
+```
+
+```{r, fig.height = 2}
+g5   <- ggplot(NULL, aes(c(0, 1))) + 
+   geom_area(stat = "function", fun = dunif, fill = "grey95", 
+            colour = "grey60", args = list(min = 0.01, max = 0.99)) +  
+  scale_x_continuous(breaks = c(0, 0.5, 1)) +
+  theme_pubr() +
+  labs(y = "",
+       x = bquote(omega)) +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+g5
+```
+
+```{r, fig.height = 2}
+g6 <- ggplot(NULL, aes(c(0, 20))) +
+  geom_area(stat = "function", fun = dlnorm, fill = "grey95",
+            colour = "grey60", args = list(meanlog = 1, sdlog = 1)) +
+  scale_x_continuous(breaks = c(0, 10, 20)) +
+  theme_pubr() +
+  labs(y = "",
+       x = "I(0)") +
+  theme(axis.line.y = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text.y = element_blank())
+
+g7   <- g6 + labs(y = "",
+       x = "E(0)",
+       title = "")
+
+print(g6 + g7)
+```
+
+
+## Prior predictive checks
+
+First, we describe the SEIR model.
+
+```{r}
+# parameters
+stp_time <- nrow(flu_data)
+parameters <- list(start = 1, stop = stp_time-1, dt = 1/32)
+
+#levels
+levels <- list(
+  # The entire population is assumed susceptible at the beginning of the pandemic wave
+  list(name = "S", equation = "BR-IR-HR1", initValue = 550000),
+  list(name = "E", equation = "IR-ER-HR2", initValue = 0),
+  list(name = "A", equation = "AR-RR11-HR3", initValue = 0),
+  list(name = "I", equation = "PR-DR-RR12-HR4", initValue = 0),
+  list(name = "J", equation = "DR-RR2-MR-HR5", initValue = 0),
+  list(name = "R", equation = "RR11+RR12+RR2-HR6", initValue = 0),
+  list(name = "D", equation = "MR", initValue = 0),
+  list(name = "C", equation = "DR", initValue = 0)
+)
+
+# variables
+vars <- list(
+  list(name = "gamma_1", equation = "omega*alpha"),
+  list(name = "DR", equation = "I*alpha"),
+  list(name = "delta", equation = "(cfp/(1-cfp))*(mu+gamma_2)"),
+  list(name = "MR", equation = "J*delta"),
+  list(name = "gamma_2", equation = "1/((1/gamma_1)-(1/alpha))"),
+  list(name = "RR2", equation = "J*gamma_2"),
+  list(name = "RR12", equation = "I*gamma_1"),
+  list(name = "RR11", equation = "A*gamma_1"),
+  list(name = "PR", equation = "rho*ER"),
+  list(name = "AR", equation = "(1-rho)*ER"),
+  list(name = "ER", equation = "E*k"),
+  list(name = "lambda", equation = "((I+J+q*A)*beta)/N"),
+  list(name = "IR", equation = "lambda*S"),
+  list(name = "HR6", equation = "mu*R"),
+  list(name = "HR5", equation = "mu*J"),
+  list(name = "HR4", equation = "mu*I"),
+  list(name = "HR3", equation = "mu*A"),
+  list(name = "HR2", equation = "mu*E"),
+  list(name = "HR1", equation = "mu*S"),
+  list(name = "BR", equation = "mu*N"),
+  list(name = "N", equation = "S+E+I+A+J+R")
+)
+variables <- arrange_variables(vars)
+
+# constants
+# According to the tests performed, these initial values do not affect the first part of the analysis.
+# Check for the second part
+constants <- list(
+  list(name = "mu", value = 1/(60*365)),  # As specified in the paper
+  list(name = "beta", value = 1.25),
+  list(name = "q", value = 0.02),
+  list(name = "k", value = 1/1.9),  # As specified in the paper
+  list(name = "rho", value = 0.36),
+  # list(name = "gamma_1", value = 0.4),
+  list(name = "omega", value = 0.5),
+  list(name = "alpha", value = 1),
+  list(name = "cfp", value = 0.067),  # As specified in the paper
+  list(name = "I0", value = 0),
+  list(name = "E0", value = 0)
+)
+
+model_structure <- list(parameters = parameters,
+                        levels = levels,
+                        variables = variables,
+                        constants = constants)
+
+deSolve_components <- get_deSolve_elems(model_structure)
+
+model <- list(
+  description = list(constants = constants),
+  deSolve_components = deSolve_components
+)
+```
+
+Then, we draw 500 samples from the prior distribution and simulate the model with these inputs.
+Given the computational burden of this process, we save the results in an RDS file.
+
+```{r}
+file_path <- file.path(fldr, "prior_sims.rds")
+
+n_sims     <- 500
+pop_size   <- 550000
+
+if(!file.exists(file_path)) {
+  set.seed(300194)
+  
+  E_0_sims      <- rlnorm(n_sims, 1, 1)
+  I_0_sims      <- rlnorm(n_sims, 1, 1)
+  beta_sims     <- rlnorm(n_sims, 0.5, 1)
+  q_sims        <- rbeta(n_sims, 0.75, 30)
+  rho_sims      <- rbeta(n_sims, 10, 40)
+  alpha_sims    <- rlnorm(n_sims, -0.7, 0.2)
+  omega_sims    <- runif(n_sims, 0.01, 0.99)
+  
+  consts_df  <- data.frame(beta     = beta_sims,
+                           q        = q_sims,
+                           rho      = rho_sims,
+                           omega    = omega_sims,
+                           alpha    = alpha_sims)
+  
+  stocks_df  <- data.frame(S = pop_size - E_0_sims - I_0_sims,
+                           E = E_0_sims,
+                           I = I_0_sims,
+                           C = I_0_sims)
+
+  sens_o <- sd_sensitivity_run(model$deSolve_components, start_time = 0,
+                               stop_time = stp_time, timestep = 1 / 32,
+                               multicore = TRUE, n_cores = 4, 
+                               integ_method = "rk4", stocks_df = stocks_df,
+                               consts_df = consts_df)
+  saveRDS(sens_o, file_path)
+} else {
+  sens_o <- readRDS(file_path)
+}
+```
+
+We check if the data obtained (sens_o) contain any NA values
+
+```{r}
+anyNA(sens_o)
+```
+
+And we show the values of the variables to see at a glance the range of values in which they move
+(minimum, maximum, average value...).
+
+```{r}
+summary(sens_o)
+```
+
+```{r}
+file_path <- file.path(fldr, "sens_inc.rds")
+
+if(!file.exists(file_path)) {
+  set.seed(346282)
+  sens_inc <- predictive_checks(n_sims, sens_o)  # dist = "pois"
+  
+  saveRDS(sens_inc, file_path)
+} else {
+  sens_inc <- readRDS(file_path)
+}
+```
+
+Here, we plot the results of the prior predictive checks. Dots indicate the
+actual data.
+
+```{r, fig.height = 3.5, fig.width = 7}
+g1 <- ggplot(sens_inc, aes(x = time, y = y)) +
+  geom_line(aes(group = iter), alpha = 0.1, colour = "grey50") +
+  geom_point(data = flu_data, aes(x = time, y = y), size = 0.5, 
+             colour = "steelblue") +
+  theme_pubclean() +
+  labs(y        = "Incidence [People / day]",
+       x        = "Time [Days]",
+       subtitle = "A)")
+
+print(g1)
+```
+
+We can see that there are simulations that do not present changes in any of the compartments as shown in the following image:
+
+```{r}
+sens_o5 <- filter(sens_o, iter == 5)
+
+plt <- sens_o5[ , c("time", "S", "E", "A", "I", "J", "R", "D")]
+plt <- melt(plt ,  id.vars = 'time', variable.name = 'compartment')
+
+ggplot(plt, aes(x = time, y = value)) +
+  geom_line(aes(colour = compartment)) +
+  theme_pubclean() +
+  labs(subtitle = "iter = 5")
+```
+
+But there are also simulations that do show changes in the compartments. For example, iteration 250:
+
+```{r}
+sens_o250 <- filter(sens_o, iter == 250)
+
+plt <- sens_o250[ , c("time", "S", "E", "A", "I", "J", "R", "D")]
+plt <- melt(plt ,  id.vars = 'time', variable.name = 'compartment')
+
+ggplot(plt, aes(x = time, y = value)) +
+  geom_line(aes(colour = compartment)) +
+  theme_pubclean() +
+  labs(subtitle = "iter = 250")
+```
+
+In the above simulations, it can be seen that the prior distribution produces
+simulations far off the actual data. To have a closer inspection, we filter out
+trajectories whose peak is greater than 5000 new cases in a day.
+
+```{r, fig.height = 3.5, fig.width = 7}
+max_y_df    <- sens_inc %>% group_by(iter) %>% summarise(max_y = max(y))
+filtered_df <- filter(max_y_df, max_y < 5000)
+iters       <- filtered_df$iter
+
+sens_inc2 <- filter(sens_inc, iter %in% iters)
+
+g2 <- ggplot(sens_inc2, aes(x = time, y = y)) +
+  geom_line(aes(group = iter), alpha = 0.1, colour = "grey50") +
+  geom_point(data = flu_data, aes(x = time, y = y), size = 0.5, 
+             colour = "steelblue") +
+  theme_pubclean() +
+  labs(y        = "Incidence [People / day]",
+       x        = "Time [Days]",
+       subtitle = "B)")
+
+print(g2)
+```
+
+### Measurement model
+
+In this section, we discuss the choice of the measurement model and how we 
+use prior predictive checks to guide such a decision. Initially, we opt for the
+default choice, i.e., the normal distribution. This choice implies that, at 
+every time step, the difference between the measurement and the true value
+(error) follows a normal distribution. Additionally, this distribution entails 
+that the error across all time steps is similar (homoscedasticity). In other 
+words, the magnitude of the error is indifferent to the magnitude of the true 
+value, an assumption that may seem unrealistic. As could be expected, the 
+normal distribution adds a new unknown, the standard deviation ($\delta$). To 
+test this model, we assume $\delta \sim Cauchy(0,1)$, and simulate 500
+trajectories.
+
+Next, we consider the Poisson distribution given that it has been used in the
+empirical treatment of count data, particularly concerning counts of events per 
+unit of time. This distribution lifts the constraint of equal variance across
+measurements as the error magnitude is proportional to the true number of 
+reported individuals at each time step. As with the normal distribution, we 
+generate 500 simulations.
+
+Finally, to count data, the Negative Binomial distribution is an alternative to
+the Poisson should the latter fail to capture overdispersion in the data. We 
+model such overdispersion in the Negative Binomial's scale parameter
+($\phi \sim \operatorname{Half-normal}(0,1)$). We can see that the trajectories 
+generated by the Negative Binomial are more dispersed than the ones produced by
+the Poisson distribution. Nevertheless, in this case, they do not provide a more
+accurate representation of the data. Consequently, we adopt the Poisson
+distribution as the measurement model.
+
+In addition, in the "The reproduction number for influenza" article, the following is stated:
+
+_"The stochastic version of the model is formulated as usual by taking the rates on the right-hand side of the population equations to determine the mean change $\lambda$ over the time $\tau$ of the several population classes, which is in practice extracted from a probability distribution $P[\lambda]$ with average $\lambda$. In the estimation procedure described below, $P$ is taken to be a Poisson distribution, which is the maximal entropy distribution for a discrete process for which only the average is known. If information is also available about the statistics of fluctuations, a more general distribution, such as a Negative Binomial, can be employed instead."_
+
+
+```{r, fig.height = 6}
+set.seed(102667)
+
+pois_meas <- sens_inc %>% mutate(dist = "Poisson")
+
+# Normal distributed measurements
+norm_meas   <- predictive_checks(n_sims, sens_o, "norm") %>% 
+  mutate(dist = "Normal")
+
+# Negative binomial measurements
+nbinom_meas <- predictive_checks(n_sims, sens_o, "nbinom") %>% 
+  mutate(dist = "Neg binom")
+
+meas_df <- bind_rows(pois_meas, norm_meas, nbinom_meas)
+
+n1 <- ggplot(meas_df, aes(x = time, y = y)) +
+  geom_line(aes(group = iter), alpha = 0.1, colour = "grey50") +
+  geom_point(data = flu_data, aes(x = time, y = y), size = 0.5, 
+             colour = "steelblue") +
+  facet_wrap(~dist, ncol = 1, scales = "free") +
+  theme_pubclean() +
+  labs(y        = "Incidence [People / day]",
+       x        = "Time [Days]",
+       subtitle = "")
+
+print(n1)
+```
+
+
+## Fitting
+
+For calibrating SD models in Stan, it is necessary to create a file written in
+Stan's own language. This kind of file structures the code in blocks. For this
+example, five blocks are necessary: _Functions_, _data_, _parameters_, 
+_transformed parameters_, and _model_. Here model refers to prior distributions
+and the likelihood (measurement model). The SD model is considered a function,
+which can be constructed from the model specification. This translation is possible
+thanks to the function *stan_ode_function_2* (a modification of the *stan_ode_function*
+from the *readsdr* package). Similarly, *readsdr* supports the creation of the data block.
+The other blocks must be built manually.
+
+```{r}
+pars_hat  <- c("I0", "E0", "beta", "q", "rho", "omega", "alpha")  # For next steps
+
+consts    <- sd_constants(model)
+ODE_fn    <- "SEIR"
+stan_fun  <- stan_ode_function_2(model_structure,
+                                 ODE_fn,
+                                 pars = consts$name[c(2, 3, 5:7)])  # "beta" "q" "rho" "omega" "alpha"
+
+fun_exe_line <- str_glue("  o = ode_rk45({ODE_fn}, x0, t0, ts, params);")
+```
+
+```{r}
+stan_data <- stan_data("y", type = "int", inits = FALSE)
+
+stan_params <- paste(
+  "parameters {",
+  "  real<lower = 0>            beta;",
+  "  real<lower = 0, upper = 1> q;",
+  "  real<lower = 0, upper = 1> rho;",
+  "  real<lower = 0, upper = 1> omega;",
+  "  real<lower = 0, upper = 1> alpha;",
+  "  real<lower = 0, upper = 55000> I0;",
+  "  real<lower = 0, upper = 55000> E0;",
+"}", sep = "\n")
+
+stan_tp <- paste(
+  "transformed parameters{",
+  "  vector[n_difeq] o[n_obs]; // Output from the ODE solver",
+  "  real x[n_obs];",
+  "  vector[n_difeq] x0;",
+  "  real params[n_params];",
+  "  x0[1] = 550000 - E0 - I0;",
+  "  x0[2] = E0;",
+  "  x0[3] = 0;",
+  "  x0[4] = I0;",
+  "  x0[5] = 0;",
+  "  x0[6] = 0;",
+  "  x0[7] = 0;",
+  "  x0[8] = I0;",
+  "  params[1] = beta;",
+  "  params[2] = q;",
+  "  params[3] = rho;",
+  "  params[4] = omega;",
+  "  params[5] = alpha;",
+  fun_exe_line,
+  "  x[1] =  o[1, 8]  - x0[8];",
+  "  for (i in 1:n_obs-1) {",
+  "    x[i + 1] = o[i + 1, 8] - o[i, 8] + 1e-5;",
+  "  }",
+  "}", sep = "\n")
+
+stan_model <- paste(
+  "model {",
+  "  omega   ~ uniform(0.01, 0.99);",
+  "  beta    ~ lognormal(0.5, 1);",
+  "  q       ~ beta(0.75, 30);",
+  "  rho     ~ beta(10, 40);",
+  "  alpha   ~ lognormal(-0.7, 0.2);",
+  "  I0      ~ lognormal(1, 1);",
+  "  E0      ~ lognormal(1, 1);",
+  "  y       ~ poisson(x);", 
+  "}",
+  sep = "\n")
+
+stan_gc <- paste(
+  "generated quantities {",
+  "  real log_lik;",
+  "  log_lik = poisson_lpmf(y | x);",
+  "}",
+  sep = "\n")
+
+stan_text   <- paste(stan_fun, stan_data, stan_params,
+                       stan_tp, stan_model, stan_gc, sep = "\n")
+
+stan_fldr     <- "./Stan_files/san_francisco_ext_202010"
+dir.create(stan_fldr, showWarnings = FALSE, recursive = TRUE)  
+stan_filepath <- file.path(stan_fldr, "flu_poisson_new.stan")
+
+create_stan_file(stan_text, stan_filepath)
+```
+
+We show below the code contained in the Stan file.
+
+```{r}
+cat(stan_text)
+```
+
+To perform the calibration via HMC, we must provide Stan with the calibration
+parameters. We specify 2,000 iterations (1,000 for warming-up and 1,000 for 
+sampling) and four chains. We also supply the number of parameters to be fitted
+for the SD model, the number of stocks (_n_difeq_), the simulation time, and
+San Francisco's data.
+
+```{r fit_norm, results = 'hide'}
+# Path to cmdstan
+set_cmdstan_path("/Users/redondo/cmdstan")
+
+fldr      <- "./backup_objs/san_francisco_ext_202210"
+file_path <- file.path(fldr, "fit.rds")
+
+if(!file.exists(file_path)) {
+  stan_d <- list(n_obs  = nrow(flu_data),
+               y        = flu_data$y,
+               n_params = 5,
+               n_difeq  = 8,
+               t0       = 0,
+               ts       = 1:length(flu_data$y))
+
+mod <- cmdstan_model(stan_filepath)
+
+fit <- mod$sample(data            = stan_d,
+                  seed            = 553616,
+                  chains          = 4,
+                  parallel_chains = 4,
+                  iter_warmup     = 1500,
+                  iter_sampling   = 500,
+                  refresh         = 5,
+                  save_warmup     = TRUE,
+                  output_dir      = fldr)
+                  # adapt_delta     = 0.99
+                  # step_size       = 0.1
+
+fit$save_object(file_path)
+} else {
+  fit <- readRDS(file_path)
+}
+```
+
+We note that the execution ends with the following information:
+
+\texttt{
+All 4 chains finished successfully.
+
+Mean chain execution time: 5432.4 seconds.
+
+Total execution time: 5758.2 seconds.
+}
+
+Although the model is complex, execution has taken too long.
+
+### Diagnostics
+
+Before inspecting the samples, Stan returns global diagnostics to the user 
+about the sampling process. It is expected that the result is free from
+divergent iterations or indications of pathological behaviour from the
+Bayesian Fraction of Missing Information metric. Also, iterations that
+saturate the maximum tree depth indicate a complex posterior surface. The 
+[Stan manual](https://mc-stan.org/misc/warnings.html#runtime-warnings) provides
+intuitive interpretations of these metrics.
+
+
+```{r, message = TRUE}
+# We generated this file from $fit$cmdstan_diagnose()
+fileName <- file.path(fldr, "diags.txt")
+
+if(!file.exists(fileName)) {
+  diagnosis <- fit$cmdstan_diagnose()
+  writeLines(diagnosis$stdout, fileName)
+} else {
+  readChar(fileName, file.info(fileName)$size) %>% cat()
+}
+```
+
+As we can see, the diagnostics indicate that we must change either the priors, the model or some of its parameters if we want to achieve satisfactory results.
+
+
+#### Trace plots
+
+\hfill
+
+A common approach to inspect calibration results is to check for convergence
+in trace plots.
+
+```{r, fig.height = 3}
+b1 <- trace_plot_2(fit, pars = c("beta"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b1)
+```
+
+```{r, fig.height = 3}
+b2 <- trace_plot_2(fit, pars = c("q"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b2)
+```
+
+```{r, fig.height = 3}
+b3 <- trace_plot_2(fit, pars = c("rho"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b3)
+```
+
+```{r, fig.height = 3}
+b5 <- trace_plot_2(fit, pars = c("alpha"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b5)
+```
+
+```{r, fig.height = 3}
+b4 <- trace_plot_2(fit, pars = c("omega"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b4)
+```
+
+```{r, fig.height = 3}
+b6 <- trace_plot_2(fit, pars = c("I0"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b6)
+
+# posterior  <- fit$draws(inc_warmup = TRUE) %>% as_draws_array()
+# posterior  <- posterior[1:2000, ,]
+# posterior[ , , variable = 'I0']
+```
+
+```{r, fig.height = 3}
+b7 <- trace_plot_2(fit, pars = c("E0"), n_samples = 2000, n_warmup = 1500) +
+  theme(axis.text = element_text(size = 5))
+
+print(b7)
+```
+
+We can see...
+
+#### Potential scale reduction factor ($\widehat{R}$) & Effective Sample Size ($\hat{n}_{eff}$)  
+
+\hfill
+
+$\widehat{R}$ is a convergence diagnostic, which compares the between- and 
+within-chain estimates for model parameters and other univariate quantities of
+interest. If chains have not mixed well, R-hat is larger than 1. It is 
+recommended to run at least *four chains* by default and only using the sample
+if R-hat is less than 1.01 [@Vehtari_2021]. **Stan reports R-hat, which is the
+maximum of rank normalized split-R-hat and rank normalized folded-split-R-hat,
+which works for thick-tailed distributions and is sensitive also to differences 
+in scale**.
+
+For each parameter $\theta$, we split each chain from the *sampling phase* in 
+two halves. That is, from **four** chains of 1000 draws each one, we obtain
+**eight** split chains of 500 draws each one. Then, we label the simulations as 
+$\theta_{ij} (i = 1, . . . , N; j = 1, . . . , M)$, where $N$ is the number of 
+samples per split chain, $M$ is the number of split chains, and $S = NM$ is the
+total number of draws from all chains. We subsequently transform these 
+simulations to their corresponding rank normalized values $z_{ij}$. According to
+@Vehtari_2021, we replace each value $\theta_{ij}$ by its rank $r_{ij}$ within 
+the pooled draws from all chains. Second, we transform ranks to normal scores 
+using the inverse normal transformation and a fractional offset via Equation 1:
+
+\begin{equation}
+z_{ij} = \Phi^{-1}\left(\frac{r_{ij} - 3/8}{S - 1/4}\right)
+\end{equation}
+
+Using these normal scores, we calculate $\widehat{R}$ following the formulation
+proposed by @gelman2013bayesian. Initially, we compute $B$ and $W$ , the 
+between- and within-sequence variances, respectively:
+
+\begin{equation}
+B = \frac{N}{M-1}\sum^{M}_{j = 1}(\bar{z}_{.j} - \bar{z}_{..})^2,
+\;where\; \bar{z}_{.j} = \frac{1}{n}\sum^{n}_{i = 1}z_{ij},\;
+\bar{z}_{..} = \frac{1}{M} \sum^{M}_{j=1} \bar{z}_{.j}
+\end{equation}
+
+\begin{equation}
+W = \frac{1}{M}\sum_{j = 1}^{M}s_{j}^2,\; where\;
+s_{j}^2 = \frac{1}{N-1}\sum^{n}_{i = 1}(z_{ij} - \bar{z}_{.j})^2
+\end{equation}
+
+Then, we can estimate $\widehat{var}^{+}(\theta|y)$, the marginal posterior
+variance of the parameter, by a weighted average of $W$ and $B$:
+
+\begin{equation}
+\widehat{var}^{+}(\theta|y) = \frac{N-1}{N}W + \frac{1}{N}B
+\end{equation}
+
+From (3) and (4), we obtain the rank normalized split $\widehat{R}$:
+
+\begin{equation}
+\widehat{R} = \sqrt{\frac{\widehat{var}^{+}(\theta|y)}{W}}
+\end{equation}
+
+
+To obtain the rank normalized folded-split $\widehat{R}$, we simply transform
+the simulations (Equation 6) and then apply the procedure described above 
+(Equations 1-5).
+
+\begin{equation}
+\zeta_{ij} = |\theta_{ij} - median(\theta)|
+\end{equation}
+
+For MCMC draws, we define the estimated effective sample size as
+
+\begin{equation}
+\hat{n}_{eff} = \frac{MN}{1 + 2 \sum_{t=1}^{T}\hat{\rho}_t}
+\end{equation}
+
+This quantity requires an estimate of the sum of the correlations $\rho$
+up to lag T (the first odd positive integer for which 
+${\hat{\rho}}_{T+1} + {\hat{\rho}}_{T+2}$ is negative). The correlation at any 
+specific lag $t$ (Equation 8) depends upon the estimate $\widehat{var}^{+}$ 
+and the *Variogram* at each $t$ (Equation 9).
+
+\begin{equation}
+\hat{\rho_t} = 1 - \frac{V_t}{2\widehat{var}^{+}} 
+\end{equation}
+
+\begin{equation}
+V_t = \frac{1}{M(N - t)} \sum_{j=1}^{M}\sum_{i=t+1}^{N}(z_{i,j} - z_{i -t, j})^2 
+\end{equation}
+
+We use the term *bulk effective sample size* to refer to the effective sample 
+size based on the rank normalized draws. To ensure reliable estimates of 
+variances and autocorrelations needed for $\hat{R}$ and $\hat{n}_{eff}$, 
+@Vehtari_2021 recommend that the rank-normalized effective sample size must be
+greater than 400 (100 per chain).
+
+
+```{r}
+unk_pars <- c("beta", "q", "rho", "alpha", "omega", "I0", "E0")
+
+par_matrices <- lapply(unk_pars, function(par) {
+  extract_variable_matrix(fit$draws(), par)
+})
+
+ess_vals   <- map_dbl(par_matrices, ess_bulk)
+r_hat_vals <- map_dbl(par_matrices, rhat)
+
+smy_df  <- data.frame(par      = c("beta", "q", "rho", "gamma_1", "alpha", "I(0)", "E(0)"),
+                      ess_bulk = ess_vals,
+                      rhat     = r_hat_vals)
+```
+
+```{r, echo = FALSE}
+kable(smy_df, booktab = TRUE)
+```
+
+As we can see, neither the values of the effective sample size nor the values of R meet the desired minimums to be able to use the estimations.
+
+#### Check deterministic fit
+
+\hfill
+
+Once the computation has been deemed satisfactory, we subsequently check that
+the model's expected value captures the underlying trajectory of the data.
+The reader should take into account that in each sampling iteration, Stan 
+generates a trajectory from the SD model. We compare these simulated time series
+against the measured incidence (dots) to visually examine whether the trend is 
+consistent  with the data. The solid blue line denotes the mean trajectory, and 
+the grey shaded area indicates the 95 % credible interval.
+
+```{r, fig.height = 3.5}
+posterior_df <- fit$draws() %>% as_draws_df()
+
+# We add the fixed constants
+samples_normal <- posterior_df[ , pars_hat] %>% 
+  mutate(mu = 1/(60*365), k = 1/1.9, cfp = 0.067) %>%
+  mutate(
+    gamma_1 = omega*alpha,
+    gamma_2 = 1/((1/gamma_1)-(1/alpha)),
+    delta = (cfp/(1-cfp))*(mu+gamma_2),
+    R0 = (beta*k)/(k+mu) * (rho*((1/(gamma_1+alpha+mu))+(alpha/((gamma_1+alpha+mu)*(gamma_2+delta+mu))))+((1-rho)*(q/(gamma_1+mu)))),
+    O = alpha / (alpha+gamma_1+mu),
+    ll = "Normal"
+         )
+  
+y_hat_df_norm <- extract_timeseries_var("x", posterior_df)
+
+summary_df <- y_hat_df_norm  %>% group_by(time) %>% 
+  summarise(lb = quantile(value, c(0.025, 0.975)[[1]]),
+            ub = quantile(value, c(0.025, 0.975)[[2]]),
+            y  = mean(value))
+
+ggplot(summary_df, aes(x = time , y)) +
+  geom_ribbon(aes(ymin = lb, ymax = ub), fill = "grey90") +
+  geom_line(colour = "steelblue") +
+  geom_point(data = flu_data) +
+  theme_pubclean() +
+  labs(y = "Incidence [New cases / day]", x = "Time [Days]")
+```
+
+### Posterior information
+
+#### Prior & posterior comparison
+
+\hfill
+
+A critical goal of model calibration is to gain information from the data
+about the parameters of interest. One way to accomplish such a purpose is 
+through the comparison of marginal prior and marginal posterior distributions. 
+Namely, we evaluate the knowledge acquired from the process.
+
+```{r}
+pars_df <- posterior_df[, c("beta", "q", "rho", "omega", "alpha", "I0", "E0")]
+```
+
+```{r, fig.height = 3}
+beta_df <- dplyr::select(pars_df, beta)
+
+base <- ggplot(beta_df, aes(x = beta)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 10))
+
+g1 <- base + geom_function(fun = dlnorm, args = list(meanlog = 0.5, sdlog = 1),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote(beta), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g1
+```
+
+```{r, fig.height = 3}
+q_df <- dplyr::select(pars_df, q)
+
+base <- ggplot(q_df, aes(x = q)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 0.1))
+
+g2 <- base + geom_function(fun = dbeta, args = list(shape1 = 0.75, shape = 30),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote(q), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g2
+```
+
+```{r, fig.height = 3}
+rho_df <- dplyr::select(pars_df, rho)
+
+base <- ggplot(rho_df, aes(x = rho)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 1))
+
+g3 <- base + geom_function(fun = dbeta, args = list(shape1 = 10, shape = 40),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote(rho), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g3
+```
+
+```{r, fig.height = 3}
+omega_df <- dplyr::select(pars_df, omega)
+
+base <- ggplot(omega_df, aes(x = omega)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 1))
+
+g4 <- base + geom_function(fun = dlnorm, args = list(meanlog = -0.75, sdlog = 0.1),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote(gamma[1]), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g4
+```
+
+```{r, fig.height = 3}
+alpha_df <- dplyr::select(pars_df, alpha)
+
+base <- ggplot(alpha_df, aes(x = alpha)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 5))
+
+g5 <- base + geom_function(fun = dlnorm, args = list(meanlog = 0.75, sdlog = 0.1),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote(alpha), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g5
+```
+
+```{r, fig.height = 3}
+I0_df <- dplyr::select(pars_df, I0)
+
+base <- ggplot(I0_df, aes(x = I0)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 100))
+
+g6 <- base + geom_function(fun = dlnorm, args = list(meanlog = 3, sdlog = 1),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = "I(0)", y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g6
+```
+
+```{r, fig.height = 3}
+E0_df <- dplyr::select(pars_df, E0)
+
+base <- ggplot(E0_df, aes(x = E0)) +
+  geom_density(colour = "steelblue") +
+  scale_x_continuous(limits = c(0, 100))
+
+g7 <- base + geom_function(fun = dlnorm, args = list(meanlog = 3, sdlog = 1),
+                           colour = "grey50") +
+  theme_pubr() +
+  labs(x = bquote("E(0)"), y = "") +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank())
+
+g7
+```
+
+#### Pair plots
+
+\hfill
+
+This plot helps us evaluate parameter interactions or joint distributions. The 
+lower triangular shows, through heat maps, the concentration of values in the
+x-y plane among all possible parameter pairs. The upper triangular quantifies
+such interactions by the correlation coefficients. The diagonal displays
+marginal posterior distributions.
+
+```{r}
+g <- pairs_posterior_2(pars_df, strip_text = 10, axis_text_size = 8)
+print(g)
+```
+
+
+# Original Computing Environment
+
+```{r}
+sessionInfo()
+```
