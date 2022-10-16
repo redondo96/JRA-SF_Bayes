@@ -1,0 +1,110 @@
+---
+title: "Validation"
+author: "Jair Andrade"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library(bayesplot)
+library(cmdstanr)
+library(dplyr)
+library(lubridate)
+library(readr)
+library(readsdr)
+library(readxl)
+
+source("./R/plots.R")
+```
+
+```{r}
+model_path <- "./models/SEI3RD.stmx"
+
+mdl <- read_xmile(model_path)
+```
+
+```{r}
+meas_mdl   <- list("y ~ neg_binomial_2(net_flow(C), phi)")
+
+est_params <- list(sd_prior("par_omega", "beta", c(2, 2)),
+                   sd_prior("par_beta", "lognormal", c(0.5, 1)),
+                   sd_prior("par_q", "beta", c(2, 2)),
+                   sd_prior("par_rho", "beta", c(2, 2)),
+                   sd_prior("par_alpha", "beta", c(2,2)),
+                   sd_prior("E0", "lognormal", c(1, 1), "init"),
+                   sd_prior("I0", "lognormal", c(1, 1), "init"))
+
+stan_text <- sd_Bayes(model_path, meas_mdl, est_params)
+
+stan_filepath <- "./Stan_files/SEI3RD.stan"
+
+write_file(stan_text, stan_filepath)
+
+mod <- cmdstan_model(stan_filepath)
+```
+
+```{r}
+flu_data <- read_xls("./data/rsif20060161s03.xls", range = "A6:C69") %>% 
+  rename(time = Time, y = Cases) %>% 
+  mutate(time = time + 1,
+         Date = ymd(Date),
+         Week = epiweek(Date))
+flu_data
+```
+
+```{r}
+stan_d <- list(n_obs    = nrow(flu_data),
+               y        = flu_data$y,
+               n_params = 5,
+               n_difeq  = 8,
+               t0       = 0,
+               ts       = 1:length(flu_data$y))
+
+fit <- mod$sample(data            = stan_d,
+                  seed            = 553617,
+                  chains          = 4,
+                  parallel_chains = 4,
+                  iter_warmup     = 1500,
+                  iter_sampling   = 500,
+                  refresh         = 5,
+                  save_warmup     = TRUE,
+                  adapt_delta     = 0.9)
+```
+
+```{r}
+fit$summary()
+```
+
+
+```{r}
+diagnosis <- fit$cmdstan_diagnose()
+diagnosis$stdout
+```
+
+
+
+```{r}
+posterior_array <- as.array(fit$draws())
+
+mcmc_pairs(posterior_array, 
+           pars = c("par_omega", "par_beta", "par_q", "par_alpha", "par_rho", 
+                    "E0", "I0"),
+           off_diag_args = list(size = 0.75))
+```
+
+```{r}
+posterior_df <- posterior::as_draws_df(fit$draws())
+
+var_gamma1 <- posterior_df |>
+  mutate(gamma1 = par_alpha * par_omega) |> pull(gamma1)
+```
+
+
+```{r}
+par_names <- c("par_omega", "par_beta", "par_q", "par_alpha", "par_rho", 
+                    "E0", "I0")
+pars_df <- posterior_df |> select(all_of(par_names))
+pairs_posterior(pars_df, strip_text = 7) 
+```
+
