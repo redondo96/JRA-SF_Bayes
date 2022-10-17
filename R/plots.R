@@ -1,3 +1,8 @@
+library(ggplot2)
+library(GGally)
+library(ggpubr)
+library(scales)
+
 plot_daily_incidence <- function(flu_data){
   ggplot(flu_data, aes(x = Date, y = y)) +
     geom_col(fill = "steelblue") +
