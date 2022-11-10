@@ -16,6 +16,7 @@ library(readsdr)
 library(readxl)
 
 source("./R/plots.R")
+source("./R/R0.R")
 ```
 
 ```{r}
@@ -49,7 +50,8 @@ flu_data <- read_xls("./data/rsif20060161s03.xls", range = "A6:C69") %>%
   rename(time = Time, y = Cases) %>% 
   mutate(time = time + 1,
          Date = ymd(Date),
-         Week = epiweek(Date))
+         Week = epiweek(Date)) |> 
+  filter(time < 18)
 flu_data
 ```
 
@@ -82,8 +84,6 @@ diagnosis <- fit$cmdstan_diagnose()
 diagnosis$stdout
 ```
 
-
-
 ```{r}
 posterior_array <- as.array(fit$draws())
 
@@ -106,5 +106,36 @@ par_names <- c("par_omega", "par_beta", "par_q", "par_alpha", "par_rho",
                     "E0", "I0")
 pars_df <- posterior_df |> select(all_of(par_names))
 pairs_posterior(pars_df, strip_text = 7) 
+```
+
+```{r}
+x_df <- extract_timeseries_var("delta_x_1", posterior_df)
+
+ggplot(x_df, aes(time, value)) +
+  geom_line(aes(group = iter), alpha = 0.01, colour = "grey50") +
+  geom_point(data = flu_data, aes(y = y), colour = "red") +
+  theme_classic()
+```
+
+
+```{r}
+test_df <- posterior_df |> 
+  mutate(par_kappa  = 1/ 1.9,
+         par_mu     = 1 / (60 * 365),
+         var_gamma1 =  par_alpha * par_omega,
+         par_cfp    = 0.067,
+         var_gamma2 = 1/((1/var_gamma1)-(1/par_alpha)),
+         var_delta  = (par_cfp / (1 - par_cfp)) * (par_mu + var_gamma2),
+         R0 = estimate_R0(par_beta, par_kappa, par_mu, par_rho, var_gamma1, var_gamma2, par_alpha, var_delta, par_q))
+
+hist(test_df$R0)
+```
+
+```{r}
+summary(test_df$R0)
+```
+
+```{r}
+quantile(test_df$R0, c(0.01,0.025, 0.25, 0.5, 0.75, 0.975, 0.99))
 ```
 
